@@ -7,7 +7,7 @@ name = "vaultwarden-sqlite-toolkit"
 version = "1.0.0"
 description = "Offline CLI toolkit for local Vaultwarden db.sqlite3 files: vault export & emergency 2FA recovery"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "All Rights Reserved - Non-Commercial, No-Derivatives" }
 requires-python = ">=3.9"
 authors = [
     { name = "Your Name" }
