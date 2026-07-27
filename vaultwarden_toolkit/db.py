@@ -244,7 +244,7 @@ def list_ciphers_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Ciph
     try:
         rows = conn.execute(
             """
-            SELECT uuid, user_uuid, organization_uuid, type, name, notes, data,
+            SELECT uuid, user_uuid, organization_uuid, atype, name, notes, data,
                    fields, deleted_at
             FROM ciphers
             WHERE user_uuid = ?
@@ -262,7 +262,7 @@ def list_ciphers_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Ciph
             uuid=row["uuid"],
             user_uuid=row["user_uuid"],
             organization_uuid=row["organization_uuid"],
-            type=row["type"],
+            type=row["atype"],
             name=row["name"],
             notes=row["notes"],
             data=row["data"],
@@ -277,10 +277,10 @@ def list_twofactor_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Tw
     try:
         rows = conn.execute(
             """
-            SELECT uuid, user_uuid, type, enabled, data
+            SELECT uuid, user_uuid, atype, enabled, data
             FROM twofactor
             WHERE user_uuid = ?
-            ORDER BY type
+            ORDER BY atype
             """,
             (user_uuid,),
         ).fetchall()
@@ -293,7 +293,7 @@ def list_twofactor_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Tw
         TwoFactorRecord(
             uuid=row["uuid"],
             user_uuid=row["user_uuid"],
-            type=row["type"],
+            type=row["atype"],
             enabled=bool(row["enabled"]),
             data=row["data"],
         )
@@ -317,7 +317,7 @@ def delete_twofactor(
             cur = conn.execute("DELETE FROM twofactor WHERE user_uuid = ?;", (user_uuid,))
         else:
             cur = conn.execute(
-                "DELETE FROM twofactor WHERE user_uuid = ? AND type = ?;",
+                "DELETE FROM twofactor WHERE user_uuid = ? AND atype = ?;",
                 (user_uuid, type_id),
             )
         conn.commit()

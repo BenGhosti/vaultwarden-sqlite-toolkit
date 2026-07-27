@@ -69,7 +69,7 @@ CREATE TABLE ciphers (
     uuid TEXT PRIMARY KEY,
     user_uuid TEXT,
     organization_uuid TEXT,
-    type INTEGER NOT NULL,
+    atype INTEGER NOT NULL,
     name TEXT,
     notes TEXT,
     data TEXT,
@@ -80,7 +80,7 @@ CREATE TABLE ciphers (
 CREATE TABLE twofactor (
     uuid TEXT PRIMARY KEY,
     user_uuid TEXT NOT NULL,
-    type INTEGER NOT NULL,
+    atype INTEGER NOT NULL,
     enabled INTEGER NOT NULL,
     data TEXT
 );
@@ -157,24 +157,24 @@ def fake_vault(tmp_path: Path) -> FakeVault:
     )
     conn.execute(
         """
-        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, type, name, notes, data, fields, deleted_at)
+        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at)
         VALUES (?, ?, NULL, 1, ?, NULL, ?, ?, NULL)
         """,
         (login_cipher_uuid, user_uuid, enc("Example Login"), json.dumps(login_data), json.dumps(login_fields)),
     )
     conn.execute(
         """
-        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, type, name, notes, data, fields, deleted_at)
+        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at)
         VALUES (?, ?, NULL, 2, ?, ?, '{}', NULL, NULL)
         """,
         (note_cipher_uuid, user_uuid, enc(plain_note_name), enc(plain_note_body)),
     )
     conn.execute(
-        "INSERT INTO twofactor (uuid, user_uuid, type, enabled, data) VALUES (?, ?, 0, 1, '{}')",
+        "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data) VALUES (?, ?, 0, 1, '{}')",
         ("44444444-4444-4444-4444-444444444444", user_uuid),
     )
     conn.execute(
-        "INSERT INTO twofactor (uuid, user_uuid, type, enabled, data) VALUES (?, ?, 7, 1, '{}')",
+        "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data) VALUES (?, ?, 7, 1, '{}')",
         ("55555555-5555-5555-5555-555555555555", user_uuid),
     )
     conn.commit()
