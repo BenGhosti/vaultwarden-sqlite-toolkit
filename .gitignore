@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Test / coverage / type-checking artifacts ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# --- Vaultwarden database files (never commit real vault data) ---
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3.bak_*
+db.sqlite3*
+
+# --- Exported vault data (plaintext - never commit) ---
+exports/
+*.csv
+!tests/**/*.csv
+*.txt
+!README.txt
+*.json
+!package.json
+!tests/**/*.json
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
