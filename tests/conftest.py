@@ -8,10 +8,18 @@ for a known master password using the toolkit's own crypto module. This lets
 the test-suite exercise the *entire* pipeline end-to-end: derive -> unwrap
 akey -> decrypt cipher fields -> export, and confirm it round-trips back to
 the original plaintext.
+
+The shape of the data here (column names, JSON key casing, the per-item
+``key`` column) is modeled directly on a real Vaultwarden export's schema
+dump and sample rows, not assumptions. An earlier version of this fixture
+used PascalCase JSON keys ("Username", "Password", ...) that don't actually
+appear in real Vaultwarden databases (which use camelCase), so the tests
+passed while the tool silently failed to extract login fields from real data.
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
@@ -23,7 +31,8 @@ import pytest
 from vaultwarden_toolkit import crypto
 
 # Kept intentionally low so the test suite runs in well under a second;
-# production Vaultwarden instances default to 600,000 PBKDF2 iterations.
+# production Vaultwarden instances default to 600,000 iterations for both of
+# these (see PASSWORD_ITERATIONS / client_kdf_iter in a real .env).
 TEST_CLIENT_KDF_ITERATIONS = 5_000
 TEST_PASSWORD_ITERATIONS = 5_000
 
@@ -39,6 +48,7 @@ class FakeVault:
     user_uuid: str
     login_cipher_uuid: str
     note_cipher_uuid: str
+    card_cipher_uuid: str
     plain_username: str
     plain_password: str
     plain_note_name: str
@@ -47,6 +57,8 @@ class FakeVault:
     plain_uri: str
     plain_field_name: str
     plain_field_value: str
+    plain_card_number: str
+    plain_card_brand: str
 
 
 SCHEMA_SQL = """
@@ -74,7 +86,8 @@ CREATE TABLE ciphers (
     notes TEXT,
     data TEXT,
     fields TEXT,
-    deleted_at TEXT
+    deleted_at TEXT,
+    "key" TEXT
 );
 
 CREATE TABLE twofactor (
@@ -99,26 +112,40 @@ def fake_vault(tmp_path: Path) -> FakeVault:
         iterations=TEST_CLIENT_KDF_ITERATIONS,
     )
     stretched_enc, stretched_mac = crypto.stretch_master_key(master_key)
+    assert stretched_mac is not None
 
-    # Vaultwarden two-layer password hash: client-side PBKDF2 + base64,
-    # then server-side PBKDF2 with random 64-byte salt.
-    import base64 as b64_mod
+    # Vaultwarden's real two-layer password hash: client-side PBKDF2(masterKey,
+    # password, 1) -> base64 -> server-side PBKDF2(that string, random salt,
+    # password_iterations). Confirmed against src/db/models/user.rs.
     salt = os.urandom(64)
     client_hash_raw = crypto.compute_master_password_hash(master_key, MASTER_PASSWORD)
-    client_hash_b64 = b64_mod.b64encode(client_hash_raw).decode("ascii")
+    client_hash_b64 = base64.b64encode(client_hash_raw).decode("ascii")
     password_hash = crypto._pbkdf2_sha256(client_hash_b64.encode("utf-8"), salt, TEST_PASSWORD_ITERATIONS)
 
     # A random 64-byte "vault key" (32 enc + 32 mac), as Vaultwarden generates at registration.
     raw_user_key = os.urandom(64)
     user_enc_key, user_mac_key = raw_user_key[:32], raw_user_key[32:]
-
     akey = crypto.encrypt_enc_string(raw_user_key, stretched_enc, stretched_mac)
 
     user_uuid = "11111111-1111-1111-1111-111111111111"
 
-    # --- Build one encrypted Login cipher and one encrypted Secure Note cipher ---
+    def enc_with(text: str, ek: bytes, mk: bytes | None) -> str:
+        return crypto.encrypt_enc_string(text.encode("utf-8"), ek, mk)
+
     def enc(text: str) -> str:
-        return crypto.encrypt_enc_string(text.encode("utf-8"), user_enc_key, user_mac_key)
+        return enc_with(text, user_enc_key, user_mac_key)
+
+    # --- Login cipher WITH an individual per-item key (Bitwarden "cipher key
+    # encryption"): this is the encryption scheme actually used by roughly a
+    # quarter of the ciphers in a real Vaultwarden database that was tested
+    # against this fixture, and earlier versions of this tool silently fell
+    # back to the vault key for these, which fails MAC verification. ---
+    raw_item_key = os.urandom(64)
+    item_enc_key, item_mac_key = raw_item_key[:32], raw_item_key[32:]
+    encrypted_item_key = crypto.encrypt_enc_string(raw_item_key, user_enc_key, user_mac_key)
+
+    def enc_item(text: str) -> str:
+        return enc_with(text, item_enc_key, item_mac_key)
 
     plain_username = "alice"
     plain_password = "hunter2-super-secret"
@@ -127,21 +154,38 @@ def fake_vault(tmp_path: Path) -> FakeVault:
     plain_field_name = "Recovery Code"
     plain_field_value = "RC-9981-XYZ"
 
+    # Real Vaultwarden 'data' blob uses camelCase keys - confirmed directly
+    # against a live export: {"username":..., "password":..., "totp":...,
+    # "uris":[{"uri":...,"match":null,"uriChecksum":...}], "passwordRevisionDate":...}
     login_data = {
-        "Username": enc(plain_username),
-        "Password": enc(plain_password),
-        "Totp": enc(plain_totp),
-        "Uris": [{"Uri": enc(plain_uri), "Match": None}],
-        "PasswordRevisionDate": None,
+        "username": enc_item(plain_username),
+        "password": enc_item(plain_password),
+        "totp": enc_item(plain_totp),
+        "uris": [{"uri": enc_item(plain_uri), "match": None}],
+        "passwordRevisionDate": None,
+        "autofillOnPageLoad": None,
+        "fido2Credentials": [],
     }
     login_fields = [
-        {"Type": 0, "Name": enc(plain_field_name), "Value": enc(plain_field_value), "LinkedId": None}
+        {"type": 0, "name": enc_item(plain_field_name), "value": enc_item(plain_field_value), "linkedId": None}
     ]
 
     login_cipher_uuid = "22222222-2222-2222-2222-222222222222"
     note_cipher_uuid = "33333333-3333-3333-3333-333333333333"
+    card_cipher_uuid = "66666666-6666-6666-6666-666666666666"
     plain_note_name = "Wifi Password"
     plain_note_body = "Guest network: SuperSecretWifi123"
+    plain_card_number = "4111111111111111"
+    plain_card_brand = "Visa"
+
+    card_data = {
+        "cardholderName": enc("Alice Example"),
+        "brand": enc(plain_card_brand),
+        "number": enc(plain_card_number),
+        "expMonth": enc("12"),
+        "expYear": enc("2030"),
+        "code": enc("123"),
+    }
 
     conn = sqlite3.connect(str(db_path))
     conn.executescript(SCHEMA_SQL)
@@ -157,17 +201,31 @@ def fake_vault(tmp_path: Path) -> FakeVault:
     )
     conn.execute(
         """
-        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at)
-        VALUES (?, ?, NULL, 1, ?, NULL, ?, ?, NULL)
+        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at, "key")
+        VALUES (?, ?, NULL, 1, ?, NULL, ?, ?, NULL, ?)
         """,
-        (login_cipher_uuid, user_uuid, enc("Example Login"), json.dumps(login_data), json.dumps(login_fields)),
+        (
+            login_cipher_uuid,
+            user_uuid,
+            enc_item("Example Login"),
+            json.dumps(login_data),
+            json.dumps(login_fields),
+            encrypted_item_key,
+        ),
     )
     conn.execute(
         """
-        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at)
-        VALUES (?, ?, NULL, 2, ?, ?, '{}', NULL, NULL)
+        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at, "key")
+        VALUES (?, ?, NULL, 2, ?, ?, '{}', NULL, NULL, NULL)
         """,
         (note_cipher_uuid, user_uuid, enc(plain_note_name), enc(plain_note_body)),
+    )
+    conn.execute(
+        """
+        INSERT INTO ciphers (uuid, user_uuid, organization_uuid, atype, name, notes, data, fields, deleted_at, "key")
+        VALUES (?, ?, NULL, 3, ?, NULL, ?, NULL, NULL, NULL)
+        """,
+        (card_cipher_uuid, user_uuid, enc("My Visa"), json.dumps(card_data)),
     )
     conn.execute(
         "INSERT INTO twofactor (uuid, user_uuid, atype, enabled, data) VALUES (?, ?, 0, 1, '{}')",
@@ -187,6 +245,7 @@ def fake_vault(tmp_path: Path) -> FakeVault:
         user_uuid=user_uuid,
         login_cipher_uuid=login_cipher_uuid,
         note_cipher_uuid=note_cipher_uuid,
+        card_cipher_uuid=card_cipher_uuid,
         plain_username=plain_username,
         plain_password=plain_password,
         plain_note_name=plain_note_name,
@@ -195,4 +254,6 @@ def fake_vault(tmp_path: Path) -> FakeVault:
         plain_uri=plain_uri,
         plain_field_name=plain_field_name,
         plain_field_value=plain_field_value,
+        plain_card_number=plain_card_number,
+        plain_card_brand=plain_card_brand,
     )

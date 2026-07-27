@@ -46,6 +46,35 @@ def test_argon2id_requires_memory_and_parallelism():
         crypto.derive_master_key("hunter2", "a@example.com", crypto.KdfType.ARGON2ID, iterations=2)
 
 
+def test_stretch_master_key_matches_hkdf_expand_not_full_hkdf():
+    """Regression test: stretch_master_key must use HKDF-Expand (RFC 5869
+    section 2.3, master key used directly as the PRK), matching Bitwarden's
+    own client source (jslib crypto.service.ts: cryptoFunctionService.hkdfExpand).
+
+    Using full HKDF (extract-then-expand) with an empty salt is NOT
+    equivalent - HKDF-Extract with an empty salt still runs the master key
+    through one more HMAC round before expanding, producing different (and
+    incompatible) enc/mac keys. That specific mix-up previously made this
+    tool fail to decrypt anything even with the correct master password.
+    """
+    from cryptography.hazmat.primitives import hashes as _hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF, HKDFExpand
+
+    master_key = crypto.derive_master_key("hunter2", "a@example.com", crypto.KdfType.PBKDF2_SHA256, 5000)
+
+    enc_key, mac_key = crypto.stretch_master_key(master_key)
+
+    expected_enc = HKDFExpand(algorithm=_hashes.SHA256(), length=32, info=b"enc").derive(master_key)
+    expected_mac = HKDFExpand(algorithm=_hashes.SHA256(), length=32, info=b"mac").derive(master_key)
+    assert enc_key == expected_enc
+    assert mac_key == expected_mac
+
+    # And explicitly confirm it does NOT match the full-HKDF-with-empty-salt
+    # variant, so this test would have caught the regression.
+    wrong_enc = HKDF(algorithm=_hashes.SHA256(), length=32, salt=b"", info=b"enc").derive(master_key)
+    assert enc_key != wrong_enc
+
+
 def test_stretch_master_key_produces_distinct_32_byte_keys():
     master_key = crypto.derive_master_key("hunter2", "a@example.com", crypto.KdfType.PBKDF2_SHA256, 5000)
     enc_key, mac_key = crypto.stretch_master_key(master_key)

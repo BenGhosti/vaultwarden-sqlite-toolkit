@@ -270,9 +270,12 @@ def _module_twofactor(db_path: Path, conn: sqlite3.Connection, user: db.UserReco
     table.add_column("Type")
     table.add_column("Enabled")
     for idx, rec in enumerate(records, start=1):
+        label = db.two_factor_type_name(rec.type)
+        if db.is_transient_two_factor_type(rec.type):
+            label = f"[dim]{label} - leftover state, not a real 2FA method[/dim]"
         table.add_row(
             str(idx),
-            db.two_factor_type_name(rec.type),
+            label,
             "[green]yes[/green]" if rec.enabled else "[dim]no[/dim]",
         )
     console.print(table)

@@ -38,11 +38,13 @@ __all__ = [
     "checkpoint_wal",
     "delete_twofactor",
     "get_user_by_uuid",
+    "is_transient_two_factor_type",
     "list_ciphers_for_user",
     "list_twofactor_for_user",
     "list_users",
     "open_read_connection",
     "open_write_connection",
+    "two_factor_type_name",
     "verify_sqlite_file",
     "wal_sidecar_status",
 ]
@@ -84,6 +86,7 @@ class CipherRecord:
     data: str | None
     fields: str | None
     deleted_at: str | None
+    cipher_key: str | None
 
 
 @dataclass(frozen=True)
@@ -98,6 +101,12 @@ class TwoFactorRecord:
 # Bitwarden's TwoFactorProviderType enum. Older/newer Vaultwarden releases have
 # occasionally added values; verify against your own instance's source if a
 # type shows up as "Unknown".
+# Vaultwarden's actual TwoFactorType enum, confirmed against
+# src/db/models/two_factor.rs in the dani-garcia/vaultwarden source. Values
+# >= 1000 are internal implementation details (in-progress challenge/register
+# state, not a real persistent 2FA method a user "has") - is_transient_two_factor_type
+# flags these so the CLI can label them clearly instead of listing them as if
+# they were an active method someone would need to remove for recovery.
 TWO_FACTOR_TYPE_NAMES = {
     0: "Authenticator (TOTP)",
     1: "Email",
@@ -107,11 +116,25 @@ TWO_FACTOR_TYPE_NAMES = {
     5: "Remember Device",
     6: "Organization Duo",
     7: "WebAuthn (FIDO2)",
+    8: "Recovery Code",
+    1000: "U2F register challenge (transient)",
+    1001: "U2F login challenge (transient)",
+    1002: "Email verification challenge (transient)",
+    1003: "WebAuthn register challenge (transient)",
+    1004: "WebAuthn login challenge (transient)",
+    2000: "Protected action verification (transient)",
 }
 
 
 def two_factor_type_name(type_id: int) -> str:
     return TWO_FACTOR_TYPE_NAMES.get(type_id, f"Unknown ({type_id})")
+
+
+def is_transient_two_factor_type(type_id: int) -> bool:
+    """True for rows that are just leftover in-progress challenge/register
+    state rather than an actual enabled 2FA method (Vaultwarden's own source
+    labels these 'implementation details', type IDs >= 1000)."""
+    return type_id >= 1000
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +268,7 @@ def list_ciphers_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Ciph
         rows = conn.execute(
             """
             SELECT uuid, user_uuid, organization_uuid, atype, name, notes, data,
-                   fields, deleted_at
+                   fields, deleted_at, "key" AS cipher_key
             FROM ciphers
             WHERE user_uuid = ?
             ORDER BY name COLLATE NOCASE
@@ -268,6 +291,7 @@ def list_ciphers_for_user(conn: sqlite3.Connection, user_uuid: str) -> list[Ciph
             data=row["data"],
             fields=row["fields"],
             deleted_at=row["deleted_at"],
+            cipher_key=row["cipher_key"],
         )
         for row in rows
     ]

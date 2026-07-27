@@ -124,22 +124,53 @@ vaultwarden_toolkit/
 
 **Why the crypto works the way it does:** Bitwarden/Vaultwarden derive a
 32-byte *Master Key* from `KDF(masterPassword, salt=email)`, then
-HKDF-Expand that into a 32-byte encryption key and a 32-byte MAC key (the
-*Stretched Master Key*). That stretched key decrypts `users.akey`, an
-authenticated `AES-256-CBC + HMAC-SHA256` blob ("EncString"), which contains
-the user's actual 64-byte vault key (32-byte AES key + 32-byte MAC key).
-Every cipher field (`name`, `notes`, login `Username`/`Password`/`Totp`,
-card/identity fields, custom fields) is just another EncString encrypted
-with that same vault key. `crypto.py` implements exactly these primitives;
-nothing more, nothing less.
+HKDF-**Expand** (RFC 5869 §2.3 - the Master Key is used directly as the PRK,
+there is no extract phase) into a 32-byte encryption key and a 32-byte MAC
+key (the *Stretched Master Key*). This is confirmed directly against
+Bitwarden's own client source (`jslib`'s `crypto.service.ts`,
+`cryptoFunctionService.hkdfExpand`); a full HKDF (extract-then-expand) with
+an empty salt looks similar but produces different, incompatible keys, since
+the extract phase still runs the Master Key through an extra HMAC round.
+That stretched key decrypts `users.akey`, an authenticated
+`AES-256-CBC + HMAC-SHA256` blob ("EncString"), which contains the user's
+actual 64-byte vault key (32-byte AES key + 32-byte MAC key). Every cipher
+field (`name`, `notes`, login `username`/`password`/`totp`, card/identity
+fields, custom fields) is just another EncString encrypted with that same
+vault key - **unless** the cipher has its own `key` column set (Bitwarden's
+per-item "cipher key encryption" feature), in which case that column is
+itself an EncString wrapping a second 64-byte key, unwrapped with the vault
+key and used for that cipher's fields instead. Both paths are handled.
 
-**Why field decryption is schema-generic:** rather than hard-coding the
-exact shape of the `data`/`fields` JSON blobs for every cipher type (which
-has drifted slightly across Vaultwarden releases), `exporters.py` walks the
-parsed JSON and decrypts any string value that *looks like* an EncString
-(`type.iv|ct|mac`), leaving everything else (booleans, plain dates, nulls)
-untouched. This makes the tool tolerant of minor schema differences instead
-of silently dropping fields it doesn't recognize by name.
+**Password verification is a separate, two-layer check**, not part of the
+decryption path above: the client computes
+`clientHash = PBKDF2(masterKey, password, 1 iteration)`, base64-encodes it,
+and Vaultwarden re-hashes *that string* with its own random `salt` and
+`password_iterations` columns to get the value stored in `users.password_hash`
+(confirmed against `src/db/models/user.rs`: `hash_password(password.as_bytes(),
+&self.salt, self.password_iterations)`, where `password` here is the
+already-hashed value received from the client, not the raw master password).
+This lets the tool report "incorrect password" immediately rather than
+failing confusingly deep inside cipher decryption - but it's important that
+this check and the vault-key unlock above are independent: getting one right
+and the other wrong (e.g. the HKDF mix-up above) looks like "the password is
+accepted but nothing decrypts", which is a deceptively confusing failure mode.
+
+**Column names use Vaultwarden's actual Diesel/Rust schema**, not the
+Bitwarden API's JSON field names - notably `ciphers.atype` and
+`twofactor.atype` (not `type`, which is a reserved word in Rust), and
+`ciphers.data` sub-fields use **camelCase** (`username`, `password`, `totp`,
+`uris` → `uri`/`match`/`uriChecksum`), matching the live API JSON shape
+Vaultwarden stores verbatim - not the PascalCase used by the older .NET
+Bitwarden server. `exporters.py`'s field lookups are alias- and
+case-insensitive specifically so the tool works against either convention
+without needing to know in advance which one a given database uses.
+
+**2FA provider types** are mapped from Vaultwarden's actual
+`TwoFactorType` enum (`src/db/models/two_factor.rs`), including the
+`>= 1000` "implementation detail" values (`U2fRegisterChallenge`,
+`WebauthnLoginChallenge`, etc.) - these are leftover in-progress
+challenge/registration state, not real enabled methods, and Module B labels
+them accordingly rather than presenting them as something to remove.
 
 **Known limitations:**
 - Organization-owned ciphers (shared vaults) use RSA-wrapped organization
@@ -147,10 +178,11 @@ of silently dropping fields it doesn't recognize by name.
   directly by the selected user.
 - Attachments are not downloaded/decrypted (Vaultwarden stores attachment
   blobs on disk, not in the sqlite file).
-- The `TWO_FACTOR_TYPE_NAMES` mapping in `db.py` reflects Bitwarden's
-  published `TwoFactorProviderType` enum; if your Vaultwarden version has
-  added new provider types, unrecognized ones will show as `Unknown (N)`
-  rather than crashing.
+- Field-name mapping for Card/Identity ciphers covers the field set seen in
+  practice; if your Vaultwarden version adds new fields, unrecognized ones
+  are still picked up (Identity is fully generic) but Card looks for a
+  specific, documented key set in `exporters.py`.
+
 
 ---
 

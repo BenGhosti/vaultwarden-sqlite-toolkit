@@ -49,6 +49,27 @@ class DecryptedItem:
     custom_fields: dict[str, Any] = field(default_factory=dict)
 
 
+def _get_ci(data: dict[str, Any], *aliases: str) -> Any:
+    """Look up a key in a cipher's ``data``/``fields``/URI JSON object,
+    trying each alias in order and falling back to a case-insensitive scan.
+
+    Vaultwarden's ``ciphers.data`` blob has used different key casing across
+    versions - current exports use camelCase (``username``, ``password``,
+    ``totp``, ``uris`` -> ``uri``), while some historical tooling and the
+    original Bitwarden .NET server used PascalCase (``Username``,
+    ``Password``, ...). Rather than assuming one, every lookup in this module
+    goes through here so it works against either.
+    """
+    for alias in aliases:
+        if alias in data:
+            return data[alias]
+    lowered = {k.lower(): v for k, v in data.items()}
+    for alias in aliases:
+        if alias.lower() in lowered:
+            return lowered[alias.lower()]
+    return None
+
+
 def _decrypt_value(value: Any, enc_key: bytes, mac_key: bytes | None) -> Any:
     """Decrypt a single JSON value if it looks like an EncString, otherwise
     return it unchanged."""
@@ -56,14 +77,35 @@ def _decrypt_value(value: Any, enc_key: bytes, mac_key: bytes | None) -> Any:
         return value
     try:
         return crypto.decrypt_enc_string(value, enc_key, mac_key)
-    except crypto.CryptoError as exc:
+    except (crypto.CryptoError, ValueError) as exc:
         logger.warning("Failed to decrypt a field: %s", exc)
         return "<decryption error>"
 
 
 def decrypt_cipher(
-    cipher: CipherRecord, enc_key: bytes, mac_key: bytes | None
+    cipher: CipherRecord, vault_enc_key: bytes, vault_mac_key: bytes | None
 ) -> DecryptedItem:
+    """Decrypt a single cipher.
+
+    Most ciphers are encrypted directly with the user's vault key. Some
+    (Bitwarden's "cipher key encryption" feature) instead carry their own
+    wrapped key in the ``key`` column; when present, that per-item key is
+    unwrapped using the vault key and used for this cipher's own fields
+    instead. Mixing the two up produces MAC verification failures on exactly
+    the ciphers that have an individual key set.
+    """
+    enc_key, mac_key = vault_enc_key, vault_mac_key
+    if cipher.cipher_key:
+        try:
+            enc_key, mac_key = crypto.decrypt_cipher_key(cipher.cipher_key, vault_enc_key, vault_mac_key)
+        except (crypto.CryptoError, ValueError) as exc:
+            logger.warning(
+                "Cipher %s has an individual key that failed to unwrap (%s); "
+                "falling back to the vault key, fields will likely fail to decrypt",
+                cipher.uuid,
+                exc,
+            )
+
     name = _decrypt_value(cipher.name, enc_key, mac_key) or "(untitled)"
     notes = _decrypt_value(cipher.notes, enc_key, mac_key)
 
@@ -83,17 +125,26 @@ def decrypt_cipher(
             logger.warning("Cipher %s has malformed 'data' JSON; skipping", cipher.uuid)
 
     if cipher.type == 1:  # Login
-        item.username = _decrypt_value(data.get("Username"), enc_key, mac_key)
-        item.password = _decrypt_value(data.get("Password"), enc_key, mac_key)
-        item.totp = _decrypt_value(data.get("Totp"), enc_key, mac_key)
-        for uri_entry in data.get("Uris") or []:
-            decrypted_uri = _decrypt_value(uri_entry.get("Uri"), enc_key, mac_key)
+        item.username = _decrypt_value(_get_ci(data, "username", "Username"), enc_key, mac_key)
+        item.password = _decrypt_value(_get_ci(data, "password", "Password"), enc_key, mac_key)
+        item.totp = _decrypt_value(_get_ci(data, "totp", "Totp"), enc_key, mac_key)
+        for uri_entry in _get_ci(data, "uris", "Uris") or []:
+            decrypted_uri = _decrypt_value(_get_ci(uri_entry, "uri", "Uri"), enc_key, mac_key)
             if decrypted_uri:
                 item.uris.append(decrypted_uri)
     elif cipher.type == 3:  # Card
-        for key in ("CardholderName", "Brand", "Number", "ExpMonth", "ExpYear", "Code"):
-            if key in data:
-                item.card_fields[key] = _decrypt_value(data.get(key), enc_key, mac_key)
+        card_keys = (
+            ("cardholderName", "CardholderName"),
+            ("brand", "Brand"),
+            ("number", "Number"),
+            ("expMonth", "ExpMonth"),
+            ("expYear", "ExpYear"),
+            ("code", "Code"),
+        )
+        for canonical, *aliases in card_keys:
+            value = _get_ci(data, canonical, *aliases)
+            if value is not None:
+                item.card_fields[canonical] = _decrypt_value(value, enc_key, mac_key)
     elif cipher.type == 4:  # Identity
         for key, val in data.items():
             item.identity_fields[key] = _decrypt_value(val, enc_key, mac_key)
@@ -105,8 +156,8 @@ def decrypt_cipher(
         except (json.JSONDecodeError, TypeError):
             custom = []
         for entry in custom:
-            field_name = _decrypt_value(entry.get("Name"), enc_key, mac_key) or "(unnamed field)"
-            field_value = _decrypt_value(entry.get("Value"), enc_key, mac_key)
+            field_name = _decrypt_value(_get_ci(entry, "name", "Name"), enc_key, mac_key) or "(unnamed field)"
+            field_value = _decrypt_value(_get_ci(entry, "value", "Value"), enc_key, mac_key)
             item.custom_fields[field_name] = field_value
 
     return item

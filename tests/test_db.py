@@ -64,11 +64,14 @@ def test_full_pipeline_auth_and_decrypt_login_cipher(fake_vault):
         enc_key, mac_key = crypto.decrypt_user_key(user.akey, stretched_enc, stretched_mac)
 
         ciphers = db.list_ciphers_for_user(conn, user.uuid)
-        assert len(ciphers) == 2
+        assert len(ciphers) == 3
 
         items = exporters.decrypt_all_ciphers(ciphers, enc_key, mac_key)
         by_uuid = {item.cipher_uuid: item for item in items}
 
+        # This cipher uses an individual per-item key (cipher.cipher_key is
+        # set) rather than being encrypted directly with the vault key -
+        # confirms decrypt_cipher correctly unwraps and uses it.
         login = by_uuid[fake_vault.login_cipher_uuid]
         assert login.name == "Example Login"
         assert login.username == fake_vault.plain_username
@@ -80,6 +83,10 @@ def test_full_pipeline_auth_and_decrypt_login_cipher(fake_vault):
         note = by_uuid[fake_vault.note_cipher_uuid]
         assert note.name == fake_vault.plain_note_name
         assert note.notes == fake_vault.plain_note_body
+
+        card = by_uuid[fake_vault.card_cipher_uuid]
+        assert card.card_fields["number"] == fake_vault.plain_card_number
+        assert card.card_fields["brand"] == fake_vault.plain_card_brand
     finally:
         conn.close()
 
@@ -130,6 +137,55 @@ def test_export_writers_produce_expected_content(tmp_path, fake_vault):
     csv_path = exporters.export_csv(items, tmp_path / "out.csv")
     csv_text = csv_path.read_text(encoding="utf-8")
     assert fake_vault.plain_username in csv_text
+
+
+def test_login_cipher_key_is_genuinely_different_from_vault_key(fake_vault):
+    """Guards against the per-item-key test above passing for the wrong
+    reason (e.g. if the fixture accidentally reused the vault key). Directly
+    decrypting the login cipher's own 'key' column with the vault key should
+    NOT itself look like plaintext username/password bytes - decrypting it
+    should yield another 64-byte wrapped key, distinct from the vault key."""
+    conn = db.open_read_connection(fake_vault.db_path)
+    try:
+        user = db.get_user_by_uuid(conn, fake_vault.user_uuid)
+        master_key = crypto.derive_master_key(
+            fake_vault.master_password, user.email, crypto.KdfType(user.kdf_type), user.kdf_iterations
+        )
+        stretched_enc, stretched_mac = crypto.stretch_master_key(master_key)
+        vault_enc, vault_mac = crypto.decrypt_user_key(user.akey, stretched_enc, stretched_mac)
+
+        ciphers = {c.uuid: c for c in db.list_ciphers_for_user(conn, user.uuid)}
+        login_cipher = ciphers[fake_vault.login_cipher_uuid]
+        assert login_cipher.cipher_key is not None
+
+        item_enc, item_mac = crypto.decrypt_cipher_key(login_cipher.cipher_key, vault_enc, vault_mac)
+        assert item_enc != vault_enc
+        assert item_mac != vault_mac
+
+        # And decrypting the login's own password with the vault key directly
+        # (i.e. skipping the per-item unwrap) must fail - this is exactly the
+        # bug that silently produced empty/garbage fields for such ciphers.
+        login_data = json.loads(login_cipher.data)
+        with pytest.raises(crypto.MacVerificationError):
+            crypto.decrypt_enc_string(login_data["password"], vault_enc, vault_mac)
+    finally:
+        conn.close()
+
+
+def test_two_factor_type_names_match_vaultwarden_enum():
+    # Confirmed against dani-garcia/vaultwarden src/db/models/two_factor.rs
+    assert db.two_factor_type_name(0) == "Authenticator (TOTP)"
+    assert db.two_factor_type_name(7) == "WebAuthn (FIDO2)"
+    assert db.two_factor_type_name(8) == "Recovery Code"
+    assert "transient" in db.two_factor_type_name(1004).lower()
+    assert db.two_factor_type_name(9999).startswith("Unknown")
+
+
+def test_is_transient_two_factor_type():
+    assert db.is_transient_two_factor_type(1004) is True
+    assert db.is_transient_two_factor_type(2000) is True
+    assert db.is_transient_two_factor_type(0) is False
+    assert db.is_transient_two_factor_type(7) is False
 
 
 def test_list_twofactor_for_user(fake_vault):

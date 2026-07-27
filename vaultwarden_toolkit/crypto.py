@@ -38,7 +38,7 @@ from argon2.low_level import Type as Argon2Type
 from argon2.low_level import hash_secret_raw
 from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 __all__ = [
@@ -50,12 +50,15 @@ __all__ = [
     "MacVerificationError",
     "UnsupportedEncTypeError",
     "compute_master_password_hash",
+    "decrypt_cipher_key",
     "decrypt_enc_string",
     "decrypt_enc_string_bytes",
     "decrypt_user_key",
     "derive_master_key",
     "encrypt_enc_string",
+    "looks_like_enc_string",
     "stretch_master_key",
+    "unwrap_symmetric_key",
     "verify_server_password_hash",
 ]
 
@@ -207,15 +210,29 @@ def derive_master_key(
 
 
 def stretch_master_key(master_key: bytes) -> tuple[bytes, bytes]:
-    """HKDF (RFC 5869, SHA-256) the Master Key into a 32-byte encryption key
-    and a 32-byte MAC key.
+    """HKDF-Expand (RFC 5869 section 2.3, SHA-256) the Master Key into a
+    32-byte encryption key and a 32-byte MAC key.
 
-    Uses the *full* HKDF (extract + expand) with an **empty** salt, matching
-    the Bitwarden client's ``crypto.stretchKey`` (`HKDF(salt=empty, IKM=masterKey,
-    info="enc"/"mac", length=32)`).
+    This is the *expand-only* half of HKDF - the Master Key is used directly
+    as the PRK, with no extract phase. Confirmed against Bitwarden's own
+    client source (``jslib``'s ``crypto.service.ts``)::
+
+        const encKey = await this.cryptoFunctionService.hkdfExpand(key.key, 'enc', 32, 'sha256');
+        const macKey = await this.cryptoFunctionService.hkdfExpand(key.key, 'mac', 32, 'sha256');
+
+    Using full HKDF (extract + expand) with an empty salt is a common
+    mix-up, but it is NOT equivalent: HKDF-Extract with an empty salt still
+    runs the input through one more HMAC round (``PRK = HMAC(salt="", IKM)``),
+    which yields a different key than using IKM directly as the PRK. That
+    mistake silently breaks every decryption downstream of it (wrong enc/mac
+    keys -> MAC verification failures on ``akey`` and every cipher field)
+    even when the master password itself was verified correctly, since
+    password verification uses a separate, independent code path (see
+    :func:`verify_server_password_hash`). This is why "correct password,
+    still can't decrypt anything" is such a deceptive failure mode here.
     """
-    enc_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=b"enc").derive(master_key)
-    mac_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=b"mac").derive(master_key)
+    enc_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"enc").derive(master_key)
+    mac_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"mac").derive(master_key)
     return enc_key, mac_key
 
 
@@ -346,9 +363,31 @@ def encrypt_enc_string(plaintext_bytes: bytes, enc_key: bytes, mac_key: bytes | 
     return es.serialize()
 
 
+def unwrap_symmetric_key(
+    encrypted_value: str, wrapping_enc_key: bytes, wrapping_mac_key: bytes | None
+) -> tuple[bytes, bytes | None]:
+    """Decrypt an EncString that itself wraps another symmetric key (64 raw
+    bytes: 32-byte AES key + 32-byte MAC key), and split it into its two
+    halves. This same shape is used both for ``users.akey`` (wrapped by the
+    stretched Master Key) and for a cipher's individual ``key`` column
+    (wrapped by the user's own vault key) - see :func:`decrypt_user_key` and
+    :func:`decrypt_cipher_key`.
+    """
+    raw = decrypt_enc_string_bytes(encrypted_value, wrapping_enc_key, wrapping_mac_key)
+    if raw is None:
+        raise CryptoError("Wrapped key value is empty - nothing to unwrap")
+    if len(raw) == 64:
+        return raw[:32], raw[32:]
+    if len(raw) == 32:
+        # Legacy/unauthenticated keys occasionally only carry an encryption
+        # key with no separate MAC key.
+        return raw, None
+    raise CryptoError(f"Unexpected unwrapped key length: {len(raw)} bytes (expected 32 or 64)")
+
+
 def decrypt_user_key(
     encrypted_akey: str, stretched_enc_key: bytes, stretched_mac_key: bytes
-) -> tuple[bytes, bytes]:
+) -> tuple[bytes, bytes | None]:
     """Decrypt ``users.akey`` using the stretched Master Key to recover the
     user's actual Symmetric (vault) Key, split into its own enc/mac halves.
 
@@ -356,14 +395,23 @@ def decrypt_user_key(
     the first 32 bytes are the AES-256 key used for every cipher field, and the
     last 32 bytes are the HMAC-SHA256 key used to authenticate them.
     """
-    raw = decrypt_enc_string_bytes(encrypted_akey, stretched_enc_key, stretched_mac_key)
-    if raw is None:
-        raise CryptoError("users.akey is empty - cannot recover the vault key")
-    if len(raw) == 64:
-        return raw[:32], raw[32:]
-    if len(raw) == 32:
-        # Legacy accounts occasionally only have an encryption key with no
-        # separate MAC key; unauthenticated (type 0) EncStrings are expected
-        # for such vaults.
-        return raw, None  # type: ignore[return-value]
-    raise CryptoError(f"Unexpected decrypted user key length: {len(raw)} bytes (expected 32 or 64)")
+    try:
+        return unwrap_symmetric_key(encrypted_akey, stretched_enc_key, stretched_mac_key)
+    except CryptoError as exc:
+        raise CryptoError(f"Could not unwrap users.akey: {exc}") from exc
+
+
+def decrypt_cipher_key(
+    encrypted_key: str, vault_enc_key: bytes, vault_mac_key: bytes | None
+) -> tuple[bytes, bytes | None]:
+    """Decrypt a cipher's individual ``key`` column (Bitwarden's per-item
+    "cipher key encryption" feature) using the already-unwrapped vault key,
+    yielding the item-specific enc/mac keys that its own fields are actually
+    encrypted with. Only some ciphers have this set - see
+    :func:`vaultwarden_toolkit.exporters.decrypt_cipher` for the fallback to
+    the vault key when it's absent.
+    """
+    try:
+        return unwrap_symmetric_key(encrypted_key, vault_enc_key, vault_mac_key)
+    except CryptoError as exc:
+        raise CryptoError(f"Could not unwrap cipher-specific key: {exc}") from exc
