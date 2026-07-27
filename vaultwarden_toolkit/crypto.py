@@ -38,7 +38,7 @@ from argon2.low_level import Type as Argon2Type
 from argon2.low_level import hash_secret_raw
 from cryptography.hazmat.primitives import hashes, padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 __all__ = [
@@ -207,11 +207,15 @@ def derive_master_key(
 
 
 def stretch_master_key(master_key: bytes) -> tuple[bytes, bytes]:
-    """HKDF-Expand (RFC 5869, SHA-256) the Master Key into a 32-byte encryption
-    key and a 32-byte MAC key, using the Master Key directly as the PRK - this
-    matches Bitwarden's ``crypto.stretchKey`` (expand-only, no extract phase)."""
-    enc_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"enc").derive(master_key)
-    mac_key = HKDFExpand(algorithm=hashes.SHA256(), length=32, info=b"mac").derive(master_key)
+    """HKDF (RFC 5869, SHA-256) the Master Key into a 32-byte encryption key
+    and a 32-byte MAC key.
+
+    Uses the *full* HKDF (extract + expand) with an **empty** salt, matching
+    the Bitwarden client's ``crypto.stretchKey`` (`HKDF(salt=empty, IKM=masterKey,
+    info="enc"/"mac", length=32)`).
+    """
+    enc_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=b"enc").derive(master_key)
+    mac_key = HKDF(algorithm=hashes.SHA256(), length=32, salt=b"", info=b"mac").derive(master_key)
     return enc_key, mac_key
 
 
