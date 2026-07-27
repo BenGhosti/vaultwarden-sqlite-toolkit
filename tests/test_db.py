@@ -55,8 +55,10 @@ def test_full_pipeline_auth_and_decrypt_login_cipher(fake_vault):
             kdf_type=crypto.KdfType(user.kdf_type),
             iterations=user.kdf_iterations,
         )
-        computed_hash = crypto.compute_master_password_hash(master_key, fake_vault.master_password)
-        assert computed_hash == user.password_hash
+        assert crypto.verify_server_password_hash(
+            master_key, fake_vault.master_password,
+            user.salt, user.password_iterations, user.password_hash,
+        )
 
         stretched_enc, stretched_mac = crypto.stretch_master_key(master_key)
         enc_key, mac_key = crypto.decrypt_user_key(user.akey, stretched_enc, stretched_mac)
@@ -92,8 +94,10 @@ def test_wrong_master_password_is_rejected(fake_vault):
             kdf_type=crypto.KdfType(user.kdf_type),
             iterations=user.kdf_iterations,
         )
-        computed_hash = crypto.compute_master_password_hash(master_key, "totally-wrong-password")
-        assert computed_hash != user.password_hash
+        assert not crypto.verify_server_password_hash(
+            master_key, "totally-wrong-password",
+            user.salt, user.password_iterations, user.password_hash,
+        )
     finally:
         conn.close()
 

@@ -136,9 +136,13 @@ def _authenticate(user: db.UserRecord, max_attempts: int = 3) -> tuple[bytes, by
                 memory_mib=user.kdf_memory,
                 parallelism=user.kdf_parallelism,
             )
-            expected_hash = user.password_hash
-            computed_hash = crypto.compute_master_password_hash(master_key, password)
-            if not _constant_time_eq(expected_hash, computed_hash):
+            if not crypto.verify_server_password_hash(
+                master_key,
+                password,
+                user.salt,
+                user.password_iterations,
+                user.password_hash,
+            ):
                 raise crypto.IncorrectPasswordError("Incorrect master password")
 
             stretched_enc, stretched_mac = crypto.stretch_master_key(master_key)
@@ -151,12 +155,6 @@ def _authenticate(user: db.UserRecord, max_attempts: int = 3) -> tuple[bytes, by
 
     console.print("[red]Too many failed attempts.[/red]")
     return None
-
-
-def _constant_time_eq(a: bytes, b: bytes) -> bool:
-    import hmac as hmac_mod
-
-    return hmac_mod.compare_digest(a, b)
 
 
 # ---------------------------------------------------------------------------

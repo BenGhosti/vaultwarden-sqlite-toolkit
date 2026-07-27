@@ -56,6 +56,7 @@ __all__ = [
     "derive_master_key",
     "encrypt_enc_string",
     "stretch_master_key",
+    "verify_server_password_hash",
 ]
 
 
@@ -215,13 +216,11 @@ def stretch_master_key(master_key: bytes) -> tuple[bytes, bytes]:
 
 
 def compute_master_password_hash(master_key: bytes, password: str) -> bytes:
-    """Reproduce the value stored (base64) in ``users.password_hash``.
+    """Compute the client-side master password hash sent between client and server.
 
-    Bitwarden computes this as one round of PBKDF2-HMAC-SHA256 over the Master
-    Key, using the *original master password* as the salt. It exists purely for
-    server-side login verification, so we reuse it here to fail fast with a
-    clear "incorrect password" error instead of a confusing MAC failure deep
-    inside cipher decryption.
+    Raw PBKDF2-HMAC-SHA256 output (before base64 encoding). This is NOT what
+    is stored in ``users.password_hash`` — that is a *second* server-side
+    PBKDF2 applied on top (see :func:`verify_server_password_hash`).
     """
     kdf = PBKDF2HMAC(
         algorithm=hashes.SHA256(),
@@ -232,9 +231,42 @@ def compute_master_password_hash(master_key: bytes, password: str) -> bytes:
     return kdf.derive(master_key)
 
 
+def verify_server_password_hash(
+    master_key: bytes, password: str, salt: bytes, password_iterations: int, expected: bytes
+) -> bool:
+    """Replicate Vaultwarden's two-layer password hash verification.
+
+    * Layer 1 (client-side)::
+        client_hash_raw = PBKDF2(master_key, password, 1)  # 32 bytes
+        client_hash_b64 = base64(client_hash_raw)           # 44-char ASCII string
+
+    * Layer 2 (server-side, what's stored in ``users.password_hash``)::
+        stored_hash = PBKDF2(client_hash_b64_utf8, salt, password_iterations)
+    """
+    import base64 as b64_mod
+
+    client_hash_raw = compute_master_password_hash(master_key, password)
+    client_hash_b64 = b64_mod.b64encode(client_hash_raw).decode("ascii")
+
+    kdf = PBKDF2HMAC(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=salt,
+        iterations=password_iterations,
+    )
+    computed = kdf.derive(client_hash_b64.encode("utf-8"))
+    return hmac_mod.compare_digest(computed, expected)
+
+
 # ---------------------------------------------------------------------------
 # Symmetric encrypt / decrypt primitives
 # ---------------------------------------------------------------------------
+
+
+def _pbkdf2_sha256(password: bytes, salt: bytes, iterations: int, length: int = 32) -> bytes:
+    """Low-level PBKDF2-HMAC-SHA256 primitive. Exposed for testing."""
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=length, salt=salt, iterations=iterations)
+    return kdf.derive(password)
 
 
 def _aes_cbc_decrypt(ciphertext: bytes, iv: bytes, enc_key: bytes) -> bytes:

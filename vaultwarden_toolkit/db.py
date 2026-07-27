@@ -65,6 +65,8 @@ class UserRecord:
     akey: str
     private_key: str | None
     password_hash: bytes
+    salt: bytes
+    password_iterations: int
     kdf_type: int
     kdf_iterations: int
     kdf_memory: int | None
@@ -200,6 +202,7 @@ def list_users(conn: sqlite3.Connection) -> list[UserRecord]:
         rows = conn.execute(
             """
             SELECT uuid, email, name, akey, private_key, password_hash,
+                   salt, password_iterations,
                    client_kdf_type, client_kdf_iter, client_kdf_memory,
                    client_kdf_parallelism
             FROM users
@@ -219,6 +222,8 @@ def list_users(conn: sqlite3.Connection) -> list[UserRecord]:
             akey=row["akey"],
             private_key=row["private_key"],
             password_hash=row["password_hash"],
+            salt=row["salt"],
+            password_iterations=row["password_iterations"],
             kdf_type=row["client_kdf_type"],
             kdf_iterations=row["client_kdf_iter"],
             kdf_memory=row["client_kdf_memory"],

@@ -24,7 +24,8 @@ from vaultwarden_toolkit import crypto
 
 # Kept intentionally low so the test suite runs in well under a second;
 # production Vaultwarden instances default to 600,000 PBKDF2 iterations.
-TEST_PBKDF2_ITERATIONS = 5_000
+TEST_CLIENT_KDF_ITERATIONS = 5_000
+TEST_PASSWORD_ITERATIONS = 5_000
 
 MASTER_PASSWORD = "Correct-Horse-Battery-Staple-42!"
 EMAIL = "test.user@example.com"
@@ -54,6 +55,8 @@ CREATE TABLE users (
     email TEXT NOT NULL,
     name TEXT,
     password_hash BLOB NOT NULL,
+    salt BLOB NOT NULL,
+    password_iterations INTEGER NOT NULL,
     akey TEXT NOT NULL,
     private_key TEXT,
     client_kdf_type INTEGER NOT NULL,
@@ -93,10 +96,17 @@ def fake_vault(tmp_path: Path) -> FakeVault:
         password=MASTER_PASSWORD,
         email=EMAIL,
         kdf_type=crypto.KdfType.PBKDF2_SHA256,
-        iterations=TEST_PBKDF2_ITERATIONS,
+        iterations=TEST_CLIENT_KDF_ITERATIONS,
     )
     stretched_enc, stretched_mac = crypto.stretch_master_key(master_key)
-    password_hash = crypto.compute_master_password_hash(master_key, MASTER_PASSWORD)
+
+    # Vaultwarden two-layer password hash: client-side PBKDF2 + base64,
+    # then server-side PBKDF2 with random 64-byte salt.
+    import base64 as b64_mod
+    salt = os.urandom(64)
+    client_hash_raw = crypto.compute_master_password_hash(master_key, MASTER_PASSWORD)
+    client_hash_b64 = b64_mod.b64encode(client_hash_raw).decode("ascii")
+    password_hash = crypto._pbkdf2_sha256(client_hash_b64.encode("utf-8"), salt, TEST_PASSWORD_ITERATIONS)
 
     # A random 64-byte "vault key" (32 enc + 32 mac), as Vaultwarden generates at registration.
     raw_user_key = os.urandom(64)
@@ -137,11 +147,13 @@ def fake_vault(tmp_path: Path) -> FakeVault:
     conn.executescript(SCHEMA_SQL)
     conn.execute(
         """
-        INSERT INTO users (uuid, email, name, password_hash, akey, private_key,
-                            client_kdf_type, client_kdf_iter, client_kdf_memory, client_kdf_parallelism)
-        VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)
+        INSERT INTO users (uuid, email, name, password_hash, salt, password_iterations,
+                            akey, private_key, client_kdf_type, client_kdf_iter,
+                            client_kdf_memory, client_kdf_parallelism)
+        VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, NULL)
         """,
-        (user_uuid, EMAIL, "Test User", password_hash, akey, int(crypto.KdfType.PBKDF2_SHA256), TEST_PBKDF2_ITERATIONS),
+        (user_uuid, EMAIL, "Test User", password_hash, salt, TEST_PASSWORD_ITERATIONS,
+         akey, int(crypto.KdfType.PBKDF2_SHA256), TEST_CLIENT_KDF_ITERATIONS),
     )
     conn.execute(
         """
