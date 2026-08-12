@@ -1,6 +1,5 @@
 # Vaultwarden SQLite Toolkit
 
-![Tests](https://github.com/ben_ghosti/vaultwarden-sqlite-toolkit/actions/workflows/tests.yml/badge.svg)
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![Python](https://img.shields.io/badge/python-3.9%2B-blue)
 
