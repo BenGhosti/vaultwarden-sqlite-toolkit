@@ -75,7 +75,7 @@ provides two focused workflows on top of that:
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/vaultwarden-sqlite-toolkit.git
+git clone https://github.com/BenGhosti/vaultwarden-sqlite-toolkit.git
 cd vaultwarden-sqlite-toolkit
 pip install -e .
 ```
